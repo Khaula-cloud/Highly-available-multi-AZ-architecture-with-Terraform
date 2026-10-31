@@ -1,0 +1,60 @@
+#!/bin/bash
+set -euxo pipefail
+
+dnf install -y httpd mariadb105 jq stress-ng
+systemctl enable --now httpd
+
+# IMDSv2
+TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
+
+echo "OK" > /var/www/html/health
+
+# Database connectivity check (credentials come from Secrets Manager)
+cat > /usr/local/bin/dbcheck.sh <<SCRIPT
+#!/bin/bash
+SECRET=\$(aws secretsmanager get-secret-value --region ${region} --secret-id ${secret_arn} --query SecretString --output text 2>/dev/null)
+PASS=\$(echo "\$SECRET" | jq -r .password)
+USER=\$(echo "\$SECRET" | jq -r .username)
+if mysql -h ${db_endpoint} -u "\$USER" -p"\$PASS" -e "SELECT 1" ${db_name} >/dev/null 2>&1; then
+  echo "CONNECTED"
+else
+  echo "UNREACHABLE"
+fi
+SCRIPT
+chmod +x /usr/local/bin/dbcheck.sh
+
+# Status page renderer (instance id and AZ are baked in now)
+cat > /usr/local/bin/render.sh <<SCRIPT
+#!/bin/bash
+DB=\$(/usr/local/bin/dbcheck.sh)
+CPU=\$(top -bn1 | awk "/Cpu\\(s\\)/ {print 100-\\\$8}")
+cat > /var/www/html/index.html <<HTML
+<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="5">
+<title>HA Multi-AZ Demo</title>
+<style>body{font-family:sans-serif;max-width:640px;margin:40px auto;padding:0 16px}
+.card{border:1px solid #ccc;border-radius:10px;padding:20px}code{background:#eee;padding:2px 6px;border-radius:4px}</style></head>
+<body><div class="card"><h1>Highly Available Multi-AZ App</h1>
+<p>Instance: <code>$INSTANCE_ID</code></p>
+<p>Availability Zone: <code>$AZ</code></p>
+<p>CPU usage: <code>\$CPU%</code></p>
+<p>Database (RDS Multi-AZ): <code>\$DB</code></p>
+<p>Refresh to see the load balancer rotate across instances and AZs.</p>
+</div></body></html>
+HTML
+SCRIPT
+chmod +x /usr/local/bin/render.sh
+
+cat > /etc/systemd/system/render.service <<SVC
+[Unit]
+Description=Render status page
+After=httpd.service
+[Service]
+ExecStart=/bin/bash -c "while true; do /usr/local/bin/render.sh; sleep 10; done"
+Restart=always
+[Install]
+WantedBy=multi-user.target
+SVC
+systemctl daemon-reload
+systemctl enable --now render.service
